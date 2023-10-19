@@ -1,0 +1,708 @@
+---
+title: "YHT-Joining GPS Collar Data From Multiple Collar Sources"
+author: "HansMartin"
+date: "February 10, 2019"
+output: html_document
+---
+
+
+```{r}
+purrr::map(list.files("./Functions", full.names = T), source)
+
+
+require(googlesheets4)
+require(tidyr)
+require(readr)
+require(purrr)
+require(lubridate)
+require(rtools)
+require(tidyverse)
+require(rlang)
+#require(xml2)
+require(devtools)
+require(dplyr)
+#devtools::install_github("Huh/collar") #if you haven't installed the collar package from Josh Nowak's github then you will need to run this line of code.
+require(collar)
+# Elk_ID_Key<-readr::read_csv("YHT_ElkID_Alias_Lookup_Table_Updated_May_2020.csv", trim_ws = T)
+# GPSStartEnd<-read_csv("GPS_CollarID_AnimalID_CollaredDates_Jan2020.csv", trim_ws = T) 
+#GPSStartEnd<-read_sheet("docs.google.com/spreadsheets/u/1/d/13sIgFNqhZK3SIN9djBVHVs_L7lmY7F2ktfsUSUVzDJE/edit?usp=drive_web&ouid=11653251720198888460", trim_ws = T) 
+
+# download YHT_ElkID_Alias table that fixes errors in the individual animal names within the database
+# Prior Creation
+elkid_tmp <- tempfile(fileext = ".xlsx")
+
+elkid_info <- googledrive::as_id("https://docs.google.com/spreadsheets/d/1WlvpfWGD1pnlRlNTNQk8MQPur6tLVuDd/edit?usp=sharing&ouid=104734822644507342654&rtpof=true&sd=true") %>%
+  googledrive::drive_download(path = elkid_tmp, overwrite = TRUE)
+
+Elk_ID_Key <- readxl::read_xlsx(path = elkid_tmp, sheet = 1, trim_ws = T) 
+
+# download the table that specifies the start and end date of the duration of 
+# animals collared and the collar id's
+
+GPSstarttbl_tmp <- tempfile(fileext = ".xlsx")
+
+GPSstarttbl_info <- googledrive::as_id("https://docs.google.com/spreadsheets/d/1PjqPoGM0zQkU38Np4wqD-KCY0u8Gvv5Q/edit?usp=sharing&ouid=104734822644507342654&rtpof=true&sd=true") %>%
+  googledrive::drive_download(path = GPSstarttbl_tmp, overwrite = TRUE)
+
+GPSStartEnd <- readxl::read_xlsx(path = GPSstarttbl_tmp, sheet = 1, trim_ws = T) 
+```
+
+
+
+##Download collar data from vectronics webservice
+```{r}
+Vectronic_fixes_web<-fetch_vectronics( key_paths =  get_paths("./collar_download/YHT Vectronic Keys"))
+                                  
+Vectronic_fixes<- Vectronic_fixes_web 
+#this step commented out below was removed because a few collars are reporting a constant mortality message.
+#%>% filter(idmortalitystatus==1) # remove any mortality data from gps locations (only select when mortality status = normal.)
+#Vectronic_fixes %>% 
+nrow(Vectronic_fixes)
+nrow(Vectronic_fixes_web)
+Vectronic_fixes_web %>% distinct(idmortalitystatus)
+Vectronic_fixes %>% group_by(idcollar) %>% summarize(max(acquisitiontime))
+```
+###Format vectroncs webservice data
+```{r}
+Vectronic_webservice_data<-Vectronic_fixes %>% 
+  mutate(acquisitionTime=stringr::str_replace(acquisitiontime,"T","-"))   %>% 
+   separate(acquisitionTime,c("Y","m","d","hour","min","sec"),remove = F) %>%
+   mutate(GMT_DATE1=as.Date(paste(d,m,Y,sep="."), format="%d.%m.%Y")) %>% 
+   separate(GMT_DATE1, c("Y1","m1","d1"), remove=T) %>%
+   mutate(GMT_Time=paste(hour,min,sec,sep=":"),
+          GMT_DATE=paste(d1,m1,Y1,sep=".")) %>% 
+  dplyr::select(GMT_DATE=GMT_DATE,
+         GMT_TIME=GMT_Time,
+         LATITUDE=latitude,
+         LONGITUDE=longitude,
+         HEIGHT=height,
+         DOP=dop,
+         TEMP=temperature,
+         COLLAR_ID=idcollar)
+```
+##Download collar data from Lotek webservice !!!You may need to change the end date!!
+```{r}
+lotek_login("yahatinda", "festuca")
+
+# all fixes for all collars in 2020
+Lotek_fixes <- fetch_lotek_positions(start_date = "2000-01-01 00:00:00",
+                                    end_date = "2021-10-25 00:00:00")
+nrow(Lotek_fixes)
+```
+###Format Lotek collar data
+```{r}
+Lotek_webservice_data<-Lotek_fixes %>% 
+   separate(RecDateTime,c("Y","m","d","hour","min","sec"),remove = F) %>%
+   mutate(GMT_DATE1=as.Date(paste(d,m,Y,sep="."), format="%d.%m.%Y")) %>% 
+   separate(GMT_DATE1, c("Y1","m1","d1"), remove=T) %>%
+   mutate(GMT_Time=paste(hour,min,"00",sep=":"),
+          GMT_DATE=paste(d1,m1,Y1,sep=".")) %>% 
+  dplyr::select(GMT_DATE=GMT_DATE,
+         GMT_TIME=GMT_Time,
+         LATITUDE=Latitude,
+         LONGITUDE=Longitude,
+         HEIGHT=Altitude,
+         DOP=PDOP,
+         TEMP=Temperature,
+         COLLAR_ID=DeviceID)
+```
+
+##Format the look up table for GPS collars, animal ids, and collar dates
+```{r}
+
+GPSSTARTEND<-GPSStartEnd %>% 
+  separate(DateDeployed,c("Dday","Dmonth","Dyear"),remove = F) %>% 
+  separate(DateReturned,c("Rday","Rmonth","Ryear"), remove = F) %>% 
+  mutate(StartDate=paste(paste(Dyear,Dmonth,Dday, sep="-"),"17:00:00",sep=" "),
+                                                                                                                                                 StartDateformat=as.POSIXct(StartDate,format="%Y-%m-%d %H:%M:%S",tz="America/Denver"),
+                                                                                                                                                 StartDateGMT=format(StartDateformat,tz="GMT"), 
+                                                                                                                                                 EndDate=ifelse(is.na(DateReturned), paste(Sys.time()), paste(paste(Ryear,Rmonth,Rday, sep="-"),"12:00:00",sep=" ")),
+                                                                                                                                                 EndDateformat=as.POSIXct(EndDate,format="%Y-%m-%d %H:%M:%S",tz="America/Denver"),
+                                                                                                                                                 EndDateGMT=format(EndDateformat,tz="GMT")) %>%
+  filter(Type=="GPS") %>% #only use GPS collars
+  left_join(Elk_ID_Key,by=c("Elk.ID"="Alias")) %>% #make sure elk id's are correct.
+  mutate(elkid=ifelse(is.na(Animal.IDHans),
+                        Elk.ID,
+                        Animal.IDHans)) %>% 
+  dplyr::select(elkid,COLLAR_ID,StartDateGMT,EndDateGMT)
+```
+
+##Combine the webservice data and filter by when animals were collared
+```{r}
+
+Webservice_data<-bind_rows(Vectronic_webservice_data,Lotek_webservice_data) %>%
+  mutate(GMT_DATE1=as.POSIXct(GMT_DATE,format="%d.%m.%Y",tz="GMT")) %>%
+  fuzzyjoin::fuzzy_right_join(GPSSTARTEND,
+                              by=c("COLLAR_ID"="COLLAR_ID",
+                                   "GMT_DATE1"="StartDateGMT",
+                                   "GMT_DATE1"="EndDateGMT"),
+                              match_fun=list(`==`,`>=`,`<=`)
+                      ) %>% 
+  filter(!is.na(GMT_DATE)) %>% 
+  dplyr::select(GMT_DATE=GMT_DATE,
+         GMT_TIME=GMT_TIME,
+         LATITUDE=LATITUDE,
+         LONGITUDE=LONGITUDE,
+         HEIGHT=HEIGHT,
+         DOP=DOP,
+         TEMP=TEMP,
+         COLLAR_ID=COLLAR_ID.x,
+         ELKID=elkid)
+```
+
+
+##Check to make sure the number of rows is similar to the number input.
+```{r}
+nrow(Vectronic_webservice_data)+nrow(Lotek_webservice_data)-nrow(Webservice_data)
+
+Webservice_data %>% filter(COLLAR_ID=="34599")
+```
+##Make sure that all collar id's were used.
+```{r}
+bind_rows(distinct(Vectronic_webservice_data,  COLLAR_ID),distinct(Lotek_webservice_data,  COLLAR_ID)) %>% anti_join(GPSSTARTEND,by = c("COLLAR_ID"))
+
+#5 collars were not deployed due to issues: 24135,24137, 24146, 24148, 24156
+```
+
+##This section of code was used to combine Lotek GPS files from 2013-2016. However, because this data has already been included in the GPS collar data file, it is no longer necessary to run.
+
+
+Lotekfilepathname = "Lotek/"
+
+Lotek_gps_data<-list.files(path = Lotekfilepathname,
+             pattern="*.csv") %>% 
+    map_df(~read_csv(paste(Lotekfilepathname,.x,sep="/"),
+                     col_types=cols_only( LINE_NO=col_double(),
+                                          GMT_DATE=col_character(),
+                                          GMT_TIME=col_character(),
+                                          LATITUDE=col_double(),
+                                          LONGITUDE=col_double(),
+                                          HEIGHT=col_double(),
+                                          DOP=col_double(),
+                                          TEMP=col_double(),
+                                          COLLAR_ID=col_integer(),
+                                          Elk.ID2=col_character()
+                                          ),
+                     na=c("", "NA","N/A")
+                     )
+           )
+
+
+##THIS SECTION IS DEPRECATED. We now will use fetch_csv
+##This section of code pulls in manually downloaded data from vectronics collars. 
+##!!!!!!!!!!!
+#!!!!!YOU MUST RENAME ANIMAL ID to Elk.ID2, Check that the date Formats are m/d/Year, and remove special characters from latitude, longitude, height DOP!!!!!!
+#```{r}
+
+Vectronicfilepathname <-"./collar_download/2021VectronicsDownloadData/"
+
+Vectronic_gps_data<-list.files(path = Vectronicfilepathname,
+             pattern="*.csv") %>% 
+    map_df(~read_csv(paste(Vectronicfilepathname,.x,sep="/"),
+                     col_types=cols_only( No=col_double(),
+                                          UTC_Date=col_character(),
+                                          UTC_Time=col_character(),
+                                          Latitude=col_double(),
+                                          Longitude=col_double(),
+                                          Height=col_double(),
+                                          DOP=col_double(),
+                                          Temp =col_double(),
+                                          CollarID=col_integer(),
+                                          Elk.ID2=col_character()
+                                          ),
+                     
+                     na=c("", "NA","N/A")
+                     )
+           ) %>% 
+  separate(UTC_Date,c("m","d","Y")) %>% 
+  mutate(UTC_Time24=format(strptime(UTC_Time, "%I:%M:%S %p"), format="%H:%M:%S"), UTC_DateFormat=paste(d,m,Y,sep=".")) %>% 
+  dplyr::select(LINE_NO=No,
+         GMT_DATE=UTC_DateFormat,
+         GMT_TIME=UTC_Time24,
+         LATITUDE=Latitude,
+         LONGITUDE=Longitude,
+         HEIGHT=Height,
+         DOP=DOP,
+         TEMP=Temp,
+         COLLAR_ID=CollarID,
+         Elk.ID2=Elk.ID2) %>% 
+  left_join(Elk_ID_Key,by=c("Elk.ID2"="Alias")) %>% #make sure all Elk id's are correct.
+  mutate(elkid=ifelse(is.na(Animal.IDHans),
+                        Elk.ID2,
+                        Animal.IDHans)) %>% 
+  dplyr::select(ELKID=elkid, GMT_DATE,GMT_TIME,LATITUDE,LONGITUDE,HEIGHT,DOP,TEMP,COLLAR_ID,
+-Elk.ID2,-Animal.IDHans)
+Vectronic_gps_data
+#```
+```{r}
+
+Vectronicfilepathname <- list.files("./collar_download/2021VectronicsDownloadData/", full.names = T)
+
+Vectronic_gps_data<-purrr::map_dfr(Vectronicfilepathname[1], 
+                      ~readr::read_csv(.x, 
+                                       skip=1,
+                                       col_names = c(
+  "No","CollarID","UTC_Date","UTC_Time","LMT_Date", "LMT_Time", "Origin", "SCTS_Date",
+  "SCTS_Time","ECEF_X [m]","ECEF_Y [m]","ECEF_Z [m]","Latitude","Longitude","Height [m]","DOP", "FixType","3D_Error [m]", "Sats", "Sat","C/N","Sat_1","C/N_1","Sat_2", "C/N_2","Sat_3","C/N_3", "Sat_4","C/N_4", "Sat_5","C/N_5",  "Sat_6","C/N_6","Sat_7",  "C/N_7","Sat_8", "C/N_8","Sat_9","C/N_9", "Sat_10","C/N_10","Sat_11","C/N_11","Mort. Status","Activity","Main [V]","Beacon [V]","Temp [C]", "Easting", "Northing", "AnimalID", "GroupID"),
+  cols(
+    No = col_double(),
+    CollarID = col_double(),
+    UTC_Date = col_character(),
+    UTC_Time = col_time(format = ""),
+    LMT_Date = col_character(),
+    LMT_Time = col_time(format = ""),
+    Origin = col_character(),
+    SCTS_Date = col_character(),
+    SCTS_Time = col_time(format = ""),
+    `ECEF_X [m]` = col_double(),
+    `ECEF_Y [m]` = col_double(),
+    `ECEF_Z [m]` = col_double(),
+    `Latitude` = col_double(),
+    `Longitude` = col_double(),
+    `Height [m]` = col_double(),
+    DOP = col_double(),
+    FixType = col_character(),
+    `3D_Error [m]` = col_logical(),
+    Sats = col_double(),
+    Sat = col_double(),
+    `C/N` = col_double(),
+    Sat_1 = col_double(),
+    `C/N_1` = col_double(),
+    Sat_2 = col_double(),
+    `C/N_2` = col_double(),
+    Sat_3 = col_double(),
+    `C/N_3` = col_double(),
+    Sat_4 = col_double(),
+    `C/N_4` = col_double(),
+    Sat_5 = col_double(),
+    `C/N_5` = col_double(),
+    Sat_6 = col_double(),
+    `C/N_6` = col_double(),
+    Sat_7 = col_double(),
+    `C/N_7` = col_double(),
+    Sat_8 = col_double(),
+    `C/N_8` = col_double(),
+    Sat_9 = col_double(),
+    `C/N_9` = col_double(),
+    Sat_10 = col_double(),
+    `C/N_10` = col_double(),
+    Sat_11 = col_double(),
+    `C/N_11` = col_double(),
+    `Mort. Status` = col_logical(),
+    Activity = col_logical(),
+    `Main [V]` = col_double(),
+    `Beacon [V]` = col_double(),
+    `Temp [C]` = col_double(),
+    Easting = col_double(),
+    Northing = col_double(),
+    AnimalID = col_character(),
+    GroupID = col_character()
+))) %>% 
+  mutate(UTC_Date=as.Date(UTC_Date,format="%d-%b-%y")) %>% 
+  separate(UTC_Date,c("Y","m","d")) %>% 
+  mutate(UTC_Time24=format(strptime(UTC_Time, "%H:%M:%S"), format="%H:%M:%S"), 
+         UTC_DateFormat=paste(d,m,Y,sep=".")
+         ) %>% 
+  dplyr::select(LINE_NO=No,
+         GMT_DATE=UTC_DateFormat,
+         GMT_TIME=UTC_Time24,
+         LATITUDE=Latitude,
+         LONGITUDE=Longitude,
+         HEIGHT=`Height [m]`,
+         DOP=DOP,
+         TEMP=`Temp [C]`,
+         COLLAR_ID=CollarID,
+         Elk.ID2=AnimalID) %>% 
+  left_join(Elk_ID_Key,by=c("Elk.ID2"="Alias")) %>% #make sure all Elk id's are correct.
+  mutate(elkid=ifelse(is.na(Animal.IDHans),
+                        Elk.ID2,
+                        Animal.IDHans)) %>% 
+  dplyr::select(ELKID=elkid, GMT_DATE,GMT_TIME,LATITUDE,LONGITUDE,HEIGHT,DOP,TEMP,COLLAR_ID,
+-Elk.ID2,-Animal.IDHans)
+Vectronic_gps_data
+
+```
+
+##This section of code pulls in manually downloaded data from lotek collar csv files. 
+##!!!!!!!!!!!
+
+```{r}
+fpaths1 <- list.files("./collar_download/2021LotekGlobalstarDownloadedData/num_dates/", full.names = T)
+
+lotekdat1<-collar::fetch_csv(file_path = fpaths1) %>%
+  mutate(date_time_gmt=openxlsx::convertToDateTime(date_time_gmt,tz="GMT")) %>% 
+  separate(date_time_gmt,c("Y","m","d","hour","min","sec"),remove = F) %>% 
+  mutate(GMT_DATE1=as.Date(paste(d,m,Y,sep="."), format="%d.%m.%Y")) %>% 
+  separate(GMT_DATE1, c("Y1","m1","d1"), remove=T) %>% 
+  mutate(GMT_Time=paste(hour,min,sec,sep=":"), GMT_DATE=paste(d1,m1,Y1,sep=".")) %>% 
+  dplyr::select(GMT_DATE=GMT_DATE,
+         GMT_TIME=GMT_Time,
+         LATITUDE=latitude,
+         LONGITUDE=longitude,
+         HEIGHT=altitude,
+         DOP=dop,
+         TEMP=temp_c,
+         COLLAR_ID=device_id,
+         Elk.ID2=device_name) %>% 
+  left_join(Elk_ID_Key,by=c("Elk.ID2"="Alias")) %>% 
+  mutate(elkid=ifelse(is.na(Animal.IDHans),
+                        Elk.ID2,
+                        Animal.IDHans)) %>% 
+  dplyr::select(ELKID=elkid, GMT_DATE,GMT_TIME,LATITUDE,LONGITUDE,HEIGHT,DOP,TEMP,COLLAR_ID,
+-Elk.ID2,-Animal.IDHans)
+
+fpaths2 <- list.files("./collar_download/2021LotekGlobalstarDownloadedData/ch_dates/", full.names = T)
+lotekdat2<-collar::fetch_csv(file_path = fpaths2) %>%
+  separate(date_time_gmt,c("d","m","Y","hour","min"),remove = F) %>% 
+  mutate(GMT_DATE1=as.Date(paste(d,m,Y,sep="."), format="%d.%m.%y")) %>% 
+  separate(GMT_DATE1, c("Y1","m1","d1"), remove=T) %>% 
+  mutate(GMT_Time=paste(hour,min,"00",sep=":"), GMT_DATE=paste(d1,m1,Y1,sep=".")) %>% 
+  dplyr::select(GMT_DATE=GMT_DATE,
+         GMT_TIME=GMT_Time,
+         LATITUDE=latitude,
+         LONGITUDE=longitude,
+         HEIGHT=altitude,
+         DOP=dop,
+         TEMP=temp_c,
+         COLLAR_ID=device_id,
+         Elk.ID2=device_name) %>% 
+  left_join(Elk_ID_Key,by=c("Elk.ID2"="Alias")) %>% 
+  mutate(elkid=ifelse(is.na(Animal.IDHans),
+                        Elk.ID2,
+                        Animal.IDHans)) %>% 
+  dplyr::select(ELKID=elkid, GMT_DATE,GMT_TIME,LATITUDE,LONGITUDE,HEIGHT,DOP,TEMP,COLLAR_ID,
+-Elk.ID2,-Animal.IDHans)
+LotekGlobalStar_gps_data<-dplyr::bind_rows(lotekdat1, lotekdat2)
+
+```
+##THIS SECTION IS DEPRECATED. We now will use fetch_csv
+##Combine data mannually downloaded from lotek globalstar collars-> note that the heading must be changed within the .csv file.
+#```{r}
+LotekGlobalStarfilepathname = "LotekGlobalStar/"
+
+
+LotekGlobalStar_gps_data<-list.files(path = LotekGlobalStarfilepathname,
+             pattern="*.csv") %>% 
+    map_df(~read_csv(paste(LotekGlobalStarfilepathname,.x,sep="/"),
+                     col_types=cols_only(`GMT Time`=col_character(),
+                                          Latitude=col_double(),
+                                          Longitude=col_double(),
+                                          Altitude=col_double(),
+                                          DOP=col_double(),
+                                          Temperature =col_double(),
+                                          CollarID=col_integer(),
+                                          Elk.ID2=col_character()
+                                          ),
+                     
+                     na=c("", "NA","N/A")
+                     )
+           ) %>% 
+  separate(`GMT Time`,c("m","d","Y","hour","min"),remove = F) %>% 
+  mutate(GMT_DATE1=as.Date(paste(d,m,Y,sep="."), format="%d.%m.%Y")) %>% 
+  separate(GMT_DATE1, c("Y1","m1","d1"), remove=T) %>% 
+  mutate(GMT_Time=paste(hour,min,"00",sep=":"), GMT_DATE=paste(d1,m1,Y1,sep=".")) %>% 
+  dplyr::select(GMT_DATE=GMT_DATE,
+         GMT_TIME=GMT_Time,
+         LATITUDE=Latitude,
+         LONGITUDE=Longitude,
+         HEIGHT=Altitude,
+         DOP=DOP,
+         TEMP=Temperature,
+         COLLAR_ID=CollarID,
+         Elk.ID2=Elk.ID2) %>% 
+  left_join(Elk_ID_Key,by=c("Elk.ID2"="Alias")) %>% 
+  mutate(elkid=ifelse(is.na(Animal.IDHans),
+                        Elk.ID2,
+                        Animal.IDHans)) %>% 
+  dplyr::select(ELKID=elkid, GMT_DATE,GMT_TIME,LATITUDE,LONGITUDE,HEIGHT,DOP,TEMP,COLLAR_ID,
+-Elk.ID2,-Animal.IDHans)
+#```
+##Combine data sources
+```{r}
+
+New_gps_data<-bind_rows(Vectronic_gps_data,LotekGlobalStar_gps_data, Webservice_data) # ,
+New_gps_data %>% filter(is.na(ELKID)) %>% distinct(COLLAR_ID)#Make sure all data has an associated elk id
+
+```
+
+
+
+##Remove Location data that doesn't match with when animals were collared
+```{r}
+NEW_GPS_DATA<-New_gps_data %>% 
+  left_join(GPSSTARTEND,by=c("ELKID"="elkid", "COLLAR_ID"="COLLAR_ID")) %>% #only keep data from when animals were on the air.
+  separate(GMT_DATE,c("fday","fmonth","fyear"),remove = F) %>% 
+  mutate(Fix_Date_Time=paste(paste(fyear,fmonth,fday,sep="-"),GMT_TIME,sep=" "), 
+    GMT_Fix_Date_Time=as.POSIXct(Fix_Date_Time,format="%Y-%m-%d %H:%M:%OS", tz="GMT"),
+    StartDateGMT1=as.POSIXct(StartDateGMT,tz="GMT"),
+    EndDateGMT1=as.POSIXct(EndDateGMT,tz="GMT"))%>% 
+  group_by(ELKID,COLLAR_ID) %>% 
+  filter(GMT_Fix_Date_Time > StartDateGMT1 & GMT_Fix_Date_Time< EndDateGMT1) %>% 
+  ungroup() %>% 
+  dplyr::select(ELKID,GMT_DATE,GMT_TIME,GMT_Fix_Date_Time,LATITUDE,LONGITUDE,HEIGHT, DOP, TEMP, COLLAR_ID)
+```
+#Check to make sure that the number of locations for ELKID and Year look reasonable.
+```{r}
+
+NEW_GPS_DATA %>% mutate(year=format(GMT_Fix_Date_Time,"%Y")) %>% group_by(ELKID,year) %>% summarise(n())
+
+```
+##Check the data that was removed by the filter to make sure alot of data wasn't left out.
+```{r}
+removeddata<-New_gps_data %>%
+  separate(GMT_DATE,c("fday","fmonth","fyear"),remove = F) %>% 
+  mutate(Fix_Date_Time=paste(paste(fyear,fmonth,fday,sep="-"),GMT_TIME,sep=" "), 
+  GMT_Fix_Date_Time=as.POSIXct(Fix_Date_Time,format="%Y-%m-%d %H:%M:%OS", tz="GMT")) %>%
+    anti_join(NEW_GPS_DATA,by = c("ELKID"="ELKID","GMT_Fix_Date_Time"="GMT_Fix_Date_Time"))
+```
+##Check the removed data
+```{r}
+removeddata %>% group_by(ELKID,COLLAR_ID,fyear,fmonth) %>% summarise(n())
+```
+```{r}
+nrow(removeddata)
+nrow(New_gps_data)-nrow(NEW_GPS_DATA)
+nrow(New_gps_data)
+nrow(NEW_GPS_DATA)
+```
+```{r}
+NEW_GPS_DATA %>% mutate(year=format(GMT_Fix_Date_Time,"%Y")) %>% group_by(ELKID,COLLAR_ID,year) %>% summarise(n())
+```
+###Make sure the years correspond to the new data that you are uploading
+```{r}
+NEW_GPS_DATA %>% mutate(year=format(GMT_Fix_Date_Time,"%Y")) %>% distinct(year)
+write.csv(NEW_GPS_DATA,"newgpsdata")
+```
+
+
+
+#Load the latest version of the GPS collar data spreadsheet (last update was 11/18/2020)
+```{r}
+
+LastUpdatedGPSData<-read_csv("./collar_download/LastUpdatedGPSData/YHT_GPS_DATA_Updated_2020-11-24.csv",
+                             col_types = cols_only( 
+                              #X1 = col_double(),
+                              ELKID = col_character(),
+                              GMT_DATE = col_character(),
+                              GMT_TIME = col_character(),
+                              GMT_Fix_Date_Time = col_datetime(format = ""),
+                              LATITUDE = col_double(),
+                              LONGITUDE = col_double(),
+                              #GPSDATAORIGIN = col_character(),
+                              HEIGHT = col_double(),
+                              DOP = col_double(),
+                              TEMP = col_double(),
+                              COLLAR_ID = col_integer()),trim_ws = T,progress = F) %>% 
+  mutate(OLD_NEW_GPS_DATA="OLD") %>% 
+  left_join(Elk_ID_Key,by=c("ELKID"="Alias")) %>% #make sure all Elk id's are correct.
+  mutate(elkid=ifelse(is.na(Animal.IDHans),
+                        ELKID,
+                        Animal.IDHans)) %>% 
+  dplyr::select(ELKID=elkid, GMT_DATE,GMT_TIME, GMT_Fix_Date_Time, LATITUDE,LONGITUDE,HEIGHT,DOP,TEMP,COLLAR_ID,OLD_NEW_GPS_DATA) #%>% 
+  #filter(!COLLAR_ID %in% c("34603","34612","34604","34592","34599","34585")) #this filter was used to remove old data that was fixed in the latest upload from the webservice.
+
+LastUpdatedGPSData %>% distinct(ELKID)
+
+```
+
+#Remove duplicate data from the previous download that is present in the new data
+```{r}
+#Only selects data from the old database that doesn't match the updated webservice data.
+Unique_LastUpdatedGPSData<-LastUpdatedGPSData %>% anti_join(NEW_GPS_DATA, by = c("ELKID"="ELKID", "GMT_Fix_Date_Time"))
+
+```
+#Remove duplicate data from the new download that is present in the previously downloaded data
+```{r}
+#Only selects data from the updated webservice data that doesn't match old database.
+Unique_NEW_GPS_DATA<-NEW_GPS_DATA %>% anti_join(LastUpdatedGPSData, by = c("ELKID"="ELKID", "GMT_Fix_Date_Time"))
+
+```
+#Data combined using the unique new gps data combined with the old data
+```{r}
+testUPDATED_GPS_DATA<-bind_rows(Unique_NEW_GPS_DATA,LastUpdatedGPSData)%>% 
+  group_by(ELKID) %>% 
+  arrange(GMT_Fix_Date_Time) %>% 
+  ungroup()
+nrow(testUPDATED_GPS_DATA)
+```
+#Data combined using the unique old gps data combined with the new data
+#We use this combination because the new data may contain data that was not previously sent via the webservice or from collar downloads.However, make sure the number of rows for both are the same.
+```{r}
+UPDATED_GPS_DATA<-bind_rows(Unique_LastUpdatedGPSData,NEW_GPS_DATA) %>% 
+  group_by(ELKID) %>% 
+  arrange(GMT_Fix_Date_Time) %>% 
+  ungroup()
+nrow(UPDATED_GPS_DATA)
+```
+#Remove any duplicated time stamps for a given elkid
+```{r}
+UPDATED_GPS_DATA_filtered1<-UPDATED_GPS_DATA %>% 
+  dplyr::distinct(ELKID,GMT_Fix_Date_Time, .keep_all = T) 
+nrow(UPDATED_GPS_DATA_filtered1)
+```
+#Remove locations that do not exist. THese either occur as 0 or NA in the downloaded or CSV data
+```{r}
+UPDATED_GPS_DATA_filtered2<-
+  UPDATED_GPS_DATA_filtered1 %>% #only keep unique time stamps for elkid
+  filter(LATITUDE>0) %>% #remove locations that don't have data
+  filter(!is.na(LATITUDE)) #remove locations that don't have data
+
+nrow(UPDATED_GPS_DATA_filtered2)
+```
+#Check for duplicate location data. (Note that early on when fixes were shorter 'duplicate' locations are present even though they are from different times due to short fix rates.)
+```{r}
+UPDATED_GPS_DATA_filtered2 %>% group_by(ELKID, LATITUDE, LONGITUDE) %>% summarize(n=n()) %>% filter(n>1) #%>% tail() #%>% nrow()#%>% tail()
+```
+#Spot check 'duplicated' location data.
+```{r}
+UPDATED_GPS_DATA_filtered1 %>% filter(ELKID=="YLM1828_YO15") %>% filter(LONGITUDE==-115.4959) 
+```
+
+##Check that all unique elk ids and collar ids have locations on dates that don't overlap
+```{r}
+UPDATED_GPS_DATA_filtered2 %>% 
+  group_by(ELKID, COLLAR_ID, OLD_NEW_GPS_DATA) %>% 
+  summarize(min(GMT_Fix_Date_Time),max(GMT_Fix_Date_Time)) %>% 
+  arrange(ELKID) %>% 
+  group_by(ELKID) %>% 
+  filter(n()>1)
+```
+```{r}
+UPDATED_GPS_DATA_filtered2 %>% filter(ELKID=="YL152_YL63", COLLAR_ID %in%c(24140)) %>% arrange(GMT_Fix_Date_Time)
+```
+#find all Elkids that occur in the GPS data that are not found in the GPS startend database.NOTE- collars pre 2013 may not be in the GPSSTARTEND data
+```{r}
+UPDATED_GPS_DATA_filtered2 %>% distinct(ELKID) %>% anti_join(GPSSTARTEND, by=c("ELKID"="elkid")) %>% 
+write.csv("elk_ids_not_in_GPS_CollarID_Dates.csv")
+UPDATED_GPS_DATA_filtered2 %>% distinct(ELKID) %>% anti_join(GPSSTARTEND, by=c("ELKID"="elkid"))
+```
+#Check to make sure that all animals that are GPS collared have data in the GPS collar data.
+```{r}
+GPSSTARTEND %>% anti_join(UPDATED_GPS_DATA_filtered2, by=c("elkid"="ELKID"))
+
+```
+
+#Remove any locations outside of the study area.
+#```{r}
+UPDATED_GPS_DATA_filtered3<-UPDATED_GPS_DATA_filtered2 %>%
+  filter(LATITUDE>=50.859144 & LATITUDE<=52.328628 & LONGITUDE>=-116.708179 & LONGITUDE<=-114.7)
+#check to see how many locations were removed.
+nrow(UPDATED_GPS_DATA_filtered3)-nrow(UPDATED_GPS_DATA_filtered2)
+#```
+
+
+#Add sex and species to the data
+```{r}
+ALL_YHT_GPS_DATA_s_s<-UPDATED_GPS_DATA_filtered2 %>% 
+  mutate(
+  SEX=ifelse(stringr::str_detect(ELKID, "^YLM"),"Male","Female"),
+  SPECIES="Cervus_canadensis",
+  label=paste(ELKID,GMT_Fix_Date_Time, sep="_")
+  ) 
+```
+#Remove locations at the ranch house
+```{r}
+
+```
+
+###Check to make sure location data doesn't occur at the field house or someone's backyard
+```{r}
+new_dat_sf<-ALL_YHT_GPS_DATA_s_s %>% 
+  mutate(year=lubridate::year(GMT_Fix_Date_Time)) %>% 
+  filter(complete.cases(LONGITUDE,LATITUDE), 
+         !LONGITUDE==0,
+         year>2018
+         ) %>% sf::st_as_sf(coords=c("LONGITUDE","LATITUDE"),
+               crs=sp::CRS('+init=epsg:4326'))
+library(leaflet)
+map<-leaflet::leaflet(new_dat_sf  %>% mutate(label=paste(ELKID,GMT_Fix_Date_Time, sep="_"))) %>% 
+  # add different provider tiles
+  addProviderTiles(
+    "OpenStreetMap",
+    # give the layer a name
+    group = "OpenStreetMap"
+  ) %>% 
+  addProviderTiles(
+    "Esri.WorldImagery",
+    group = "Esri.WorldImagery"
+  ) %>%
+  leaflet::addMarkers(clusterOptions = markerClusterOptions(), label = ~htmltools::htmlEscape(label), labelOptions = labelOptions(noHide=F)) %>% addLayersControl(
+    baseGroups = c(
+      "OpenStreetMap",  "Esri.WorldImagery"
+    ),# position it on the topleft
+    position = "topleft"
+  )
+
+```
+
+```{r}
+#locations at the ranch house
+ranchhouselocs<-ALL_YHT_GPS_DATA_s_s %>% 
+  #mutate(label=paste(ELKID,GMT_Fix_Date_Time, sep="_")) %>% 
+  filter(complete.cases(LONGITUDE,LATITUDE), !LONGITUDE==0,
+         LATITUDE> 51.752843 & LATITUDE<51.753719 & LONGITUDE< as.numeric(-115.582989) & LONGITUDE> as.numeric(-115.583900)
+         )
+
+
+#locations from map that are unreasonable
+remove_locs<-c("YLM2009_YL15_2020-08-06 22:01:48", "YLM1802_2019-10-07 07:34:00", "YLM1824_2020-06-11 07:00:00",
+               ALL_YHT_GPS_DATA_s_s %>% filter(ELKID=="YLM1928", GMT_DATE=="11.10.2019") %>% pull(label), 
+               ranchhouselocs %>% pull(label)) 
+
+ALL_YHT_GPS_DATA <- ALL_YHT_GPS_DATA_s_s %>% filter(!label %in% remove_locs)
+
+nrow(ALL_YHT_GPS_DATA) + length(remove_locs)==nrow(ALL_YHT_GPS_DATA_s_s)
+
+nrow(ALL_YHT_GPS_DATA)-nrow(ALL_YHT_GPS_DATA_s_s)
+```
+
+
+```{r}
+ALL_YHT_GPS_DATA %>% filter(ELKID=="YLM2009_YL15") %>% summarize(n(),min(GMT_Fix_Date_Time),max(GMT_Fix_Date_Time))
+#head(ALL_YHT_GPS_DATA)
+```
+#Write to file
+```{r}
+currentDate <- Sys.Date()
+csvFileName <- paste("./collar_download/LastUpdatedGPSData/YHT_GPS_DATA_Updated_",currentDate,".csv",sep="")
+write.csv(ALL_YHT_GPS_DATA, file=csvFileName) 
+```
+
+```{r}
+collard <- readr::read_csv("./collar_download/LastUpdatedGPSData/YHT_GPS_DATA_Updated_2023-01-23.csv")
+save(collard, file = "../../data/location/collard.RData")
+
+nrow(ALL_YHT_GPS_DATA)-nrow(LastUpdatedGPSData)
+
+```
+
+#Exporting data over a period of time
+#```{r}
+#filter start
+filter_start_date1<-as.POSIXct("2019-01-01 00:00:00",format=c("%Y-%m-%d %H:%M:%S"),tz = "GMT")
+filter_start_date2<-as.POSIXct("2020-01-01 00:00:00",format=c("%Y-%m-%d %H:%M:%S"),tz = "GMT")
+filter_end_date1<-as.POSIXct("2019-05-19 00:00:00",format=c("%Y-%m-%d %H:%M:%S"),tz = "GMT")
+filter_end_date2<-as.POSIXct("2020-05-19 00:00:00",format=c("%Y-%m-%d %H:%M:%S"),tz = "GMT")
+
+Pre_COVIDJan1_May19_2019<-ALL_YHT_GPS_DATA %>% filter(GMT_Fix_Date_Time>=filter_start_date1 & GMT_Fix_Date_Time<=filter_end_date1)
+Post_COVIDJan1_May19_2020<-ALL_YHT_GPS_DATA %>% filter(GMT_Fix_Date_Time>=filter_start_date2 & GMT_Fix_Date_Time<=filter_end_date2) 
+
+Pre_COVIDJan1_May19_2019 %>% summarise(min(GMT_Fix_Date_Time),max(GMT_Fix_Date_Time))
+Post_COVIDJan1_May19_2020 %>% summarise(min(GMT_Fix_Date_Time),max(GMT_Fix_Date_Time))
+#```
+#```{r}
+Pre_COVIDJan1_May19_2019 %>% group_by(ELKID) %>% summarise(n())
+
+Post_COVIDJan1_May19_2020 %>% group_by(ELKID) %>% summarise(n())
+#```
+Summarizing the number of animal years
+#```{r}
+Pre_COVIDJan1_May19_2019 %>% distinct(ELKID) %>%  summarise(n())
+
+Post_COVIDJan1_May19_2020 %>% distinct(ELKID) %>%   summarise(n())
+#```
+#```{r}
+YHT_GPS_Elk_Jan1_May19_2019_Jan1_May19_2020<-bind_rows(Pre_COVIDJan1_May19_2019,Post_COVIDJan1_May19_2020)
+write_csv(YHT_GPS_Elk_Jan1_May19_2019_Jan1_May19_2020,"YHT_Elk_GPSCollarData_Jan1_May19_2019_Jan1_May19_2020.csv" )
+#```
+
